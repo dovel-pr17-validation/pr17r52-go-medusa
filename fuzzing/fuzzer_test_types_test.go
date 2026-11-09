@@ -1,0 +1,123 @@
+package fuzzing
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/crytic/medusa/compilation"
+	"github.com/crytic/medusa/compilation/platforms"
+	"github.com/crytic/medusa/fuzzing/config"
+	"github.com/crytic/medusa/utils/testutils"
+	"github.com/stretchr/testify/assert"
+)
+
+// fuzzerTest is an interface which is used to implement different test structures to invoke a test against the Fuzzer.
+type fuzzerTest interface {
+	// run describes a method which can be called abstractly, which takes data from an implementing structure and
+	// runs a test against the Fuzzer with it.
+	run(t *testing.T)
+}
+
+// runFuzzerTest takes a given fuzzerTest and testing state and executes the fuzzerTest with that state.
+// It is a wrapper for test.Run(t).
+func runFuzzerTest(t *testing.T, test fuzzerTest) {
+	test.run(t)
+}
+
+// fuzzerSolcFileTest describes a test to be run against the Fuzzer using a single Solidity contract file.
+type fuzzerSolcFileTest struct {
+	// filePath describes the relative path from the current package to the source file to be tested.
+	filePath string
+
+	// solcVersion describes the version of solc to use to compile this test.
+	solcVersion string
+
+	// configUpdates is a function which can be used to create updates to the default project configuration used for
+	// testing, allowing for greater configuration of tests.
+	configUpdates func(config *config.ProjectConfig)
+
+	// method is the actual testing logic to execute once a Fuzzer has been created with the previously mentioned
+	// project configuration, and the relevant testing context has been created.
+	method func(fc *fuzzerTestContext)
+}
+
+// Default solc version used in tests
+const DEFAULT_TEST_SOLC_VERSION string = "0.8.28"
+
+// run implements fuzzerTest.run for a single Solidity test file described by the fuzzerSolcFileTest.
+func (c *fuzzerSolcFileTest) run(t *testing.T) {
+	t.Run(c.filePath, func(t *testing.T) {
+		// Print a status message
+		fmt.Printf("##############################################################\n")
+		fmt.Printf("Fuzzing '%s'...\n", c.filePath)
+		fmt.Printf("##############################################################\n")
+
+		// Copy our target file to our test directory
+		contractTestPath := testutils.CopyToTestDirectory(t, c.filePath)
+
+		// Run the test in our temporary test directory to avoid artifact pollution.
+		testutils.ExecuteInDirectory(t, contractTestPath, func() {
+			// Create a default solc platform config
+			solcPlatformConfig := platforms.NewCryticCompilationConfig(contractTestPath)
+			if c.solcVersion != "" {
+				solcPlatformConfig.SolcVersion = c.solcVersion
+			} else {
+				solcPlatformConfig.SolcVersion = DEFAULT_TEST_SOLC_VERSION
+			}
+
+			// Wrap the platform config in a compilation config
+			compilationConfig, err := compilation.NewCompilationConfigFromPlatformConfig(solcPlatformConfig)
+			assert.NoError(t, err)
+
+			// Now create a project configuration.
+			projectConfig := getFuzzerTestingProjectConfig(t, compilationConfig)
+
+			// Run our config updates method provided for this test case.
+			if c.configUpdates != nil {
+				c.configUpdates(projectConfig)
+			}
+
+			// Run our test case
+			executeFuzzerTestMethodInternal(t, projectConfig, c.method)
+		})
+	})
+}
+
+// fuzzerProjectTest describes a test to be run against the Fuzzer using a full external project.
+type fuzzerProjectTest struct {
+	// projectPath describes the path to the external project directory containing a medusa.json config file.
+	projectPath string
+
+	// configUpdates is an optional function which can be used to update the project configuration loaded
+	// from medusa.json, allowing for programmatic configuration adjustments during testing.
+	configUpdates func(config *config.ProjectConfig)
+
+	// method is the actual testing logic to execute once a Fuzzer has been created with the project configuration
+	// and the relevant testing context has been created.
+	method func(fc *fuzzerTestContext)
+}
+
+// run implements fuzzerTest.run for a full external project described by the fuzzerProjectTest.
+func (p *fuzzerProjectTest) run(t *testing.T) {
+	t.Run(p.projectPath, func(t *testing.T) {
+		// Print a status message
+		fmt.Printf("##############################################################\n")
+		fmt.Printf("Fuzzing external project '%s'...\n", p.projectPath)
+		fmt.Printf("##############################################################\n")
+
+		// Execute the test in the project directory
+		testutils.ExecuteInDirectory(t, p.projectPath, func() {
+			// Read the medusa.json configuration from the project directory
+			projectConfig, err := config.ReadProjectConfigFromFile("medusa.json", "crytic-compile")
+			assert.NoError(t, err)
+
+			// Apply any config updates provided for this test case
+			if p.configUpdates != nil {
+				p.configUpdates(projectConfig)
+			}
+
+			// Run our test case
+			executeFuzzerTestMethodInternal(t, projectConfig, p.method)
+		})
+	})
+}
